@@ -11,13 +11,28 @@
 //! - **`$`** also matches before a final line terminator in Java. The translation of that is a look-around, which would push every
 //!   pattern with a `$` onto the slow engine, so [`translate`] reports `has_dollar` and the caller compiles the Java variant lazily,
 //!   only for texts that end in a line terminator.
+//! - **`.`** excludes every Java line terminator (`\n \r \u0085 \u2028 \u2029`; only `\n` under `(?d)`) unless `(?s)`.
+//! - **`\p{..}`**: `javaUpperCase`-style classes, `InCyrillic` blocks (from the JDK's own block table), `IsAlphabetic`/`IsGreek`/`IsL`, `script=`,
+//!   `block=`, `gc=` and the POSIX names are translated; a block Java does not know is an error.
+//! - Patterns Java rejects (an unclosed class, a `{` that is not a quantifier) are errors, and a back-reference to a group that does not exist
+//!   never matches, as in Java.
 //! - `\h`, `\H`, `\Q..\E` are expanded.
 //!
 //! Anything else, including invalid patterns, passes through unchanged so it fails the way it always did.
 
+use super::java_blocks::block_range;
+
 /// Java's non-multiline `$` as an expression the Rust engines read: end of text, or before a final line terminator (`\r\n` counts as
 /// one terminator, so there is no match between the `\r` and the `\n`).
 const JAVA_DOLLAR: &str = r"(?:\z|(?=\r\n\z)|(?<!\r)(?=\n\z)|(?=[\r\x{85}\x{2028}\x{2029}]\z))";
+
+/// Java's `Hex_Digit`: any decimal digit, `a-f`, `A-F` and their fullwidth forms.
+const HEX_DIGIT: &str = r"[\p{Nd}a-fA-F\x{FF21}-\x{FF26}\x{FF41}-\x{FF46}]";
+
+/// Java's `$` under `(?d)` (`UNIX_LINES`): only `\n` is a line terminator.
+const JAVA_DOLLAR_UNIX: &str = r"(?:\z|(?=\n\z))";
+/// Java's `.`: anything but a line terminator.
+const JAVA_DOT: &str = r"[^\n\r\x{85}\x{2028}\x{2029}]";
 
 /// `\h`: horizontal whitespace.
 const HSPACE: &str = r"\x20\t\x{A0}\x{1680}\x{180E}\x{2000}-\x{200A}\x{202F}\x{205F}\x{3000}";
@@ -33,11 +48,19 @@ const POSIX: &[(&str, &str, &str)] = &[
     ("Digit", "[[:digit:]]", r"\p{Nd}"),
     ("Alnum", "[[:alnum:]]", r"[\p{Alphabetic}\p{Nd}]"),
     ("Punct", "[[:punct:]]", r"\p{P}"),
-    ("Graph", "[[:graph:]]", r"[^\p{Z}\p{C}]"),
-    ("Print", "[[:print:]]", r"[^\p{C}\p{Zl}\p{Zp}]"),
+    (
+        "Graph",
+        "[[:graph:]]",
+        r"[^\p{White_Space}\p{Cc}\p{Cs}\p{Cn}]",
+    ),
+    (
+        "Print",
+        "[[:print:]]",
+        r"[[^\p{White_Space}\p{Cc}\p{Cs}\p{Cn}]\p{Zs}\t&&[^\p{Cc}]]",
+    ),
     ("Blank", "[[:blank:]]", r"[\p{Zs}\t]"),
     ("Cntrl", "[[:cntrl:]]", r"\p{Cc}"),
-    ("XDigit", "[[:xdigit:]]", "[0-9a-fA-F]"),
+    ("XDigit", "[[:xdigit:]]", HEX_DIGIT),
     ("Space", "[ \\t\\n\\x0B\\f\\r]", r"\s"),
 ];
 
@@ -57,6 +80,8 @@ pub struct Translated {
     /// A back-reference appears under ASCII-only `(?i)`; the expansion cannot make that compare case-insensitively, so the caller
     /// must translate again with `ascii_icase_expansion: false`.
     pub needs_icase_fallback: bool,
+    /// The pattern is invalid in Java and is rejected here too (message in Java's words).
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -65,6 +90,8 @@ struct State {
     unicode_case: bool,
     unicode_class: bool,
     multiline: bool,
+    dotall: bool,
+    unix_lines: bool,
     /// Whether the Rust engine currently has `i` on at this point of the output.
     rust_icase: bool,
 }
@@ -85,6 +112,9 @@ struct Scanner {
     out: String,
     has_dollar: bool,
     needs_fallback: bool,
+    error: Option<String>,
+    /// Capturing groups in the whole pattern, for back-references to groups that do not exist.
+    groups: usize,
 }
 
 pub fn translate(pattern: &str, opts: Options) -> Translated {
@@ -94,18 +124,49 @@ pub fn translate(pattern: &str, opts: Options) -> Translated {
         out: String::with_capacity(pattern.len() + 16),
         has_dollar: false,
         needs_fallback: false,
+        error: None,
+        groups: 0,
     };
+    s.groups = s.count_groups();
     s.run();
     Translated {
         pattern: s.out,
         has_dollar: s.has_dollar,
         needs_icase_fallback: s.needs_fallback,
+        error: s.error,
     }
 }
 
 impl Scanner {
     fn at(&self, i: usize) -> Option<char> {
         self.chars.get(i).copied()
+    }
+
+    fn fail(&mut self, message: &str) {
+        self.error.get_or_insert_with(|| message.to_string());
+    }
+
+    /// Capturing groups: `(` not followed by `?`, or by `?<name>` (not `?<=` / `?<!`), outside classes and escapes.
+    fn count_groups(&self) -> usize {
+        let (mut n, mut i, mut class) = (0, 0, 0usize);
+        while i < self.chars.len() {
+            match self.chars[i] {
+                '\\' => i += 1,
+                '[' => class += 1,
+                ']' if class > 0 => class -= 1,
+                '(' if class == 0 => {
+                    let named = self.at(i + 1) == Some('?')
+                        && self.at(i + 2) == Some('<')
+                        && !matches!(self.at(i + 3), Some('=' | '!'));
+                    if self.at(i + 1) != Some('?') || named {
+                        n += 1;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        n
     }
 
     fn run(&mut self) {
@@ -127,13 +188,24 @@ impl Scanner {
                 }
                 '$' if !st.multiline => {
                     self.has_dollar = true;
-                    self.out.push_str(if self.opts.java_dollar {
-                        JAVA_DOLLAR
+                    self.out
+                        .push_str(match (self.opts.java_dollar, st.unix_lines) {
+                            (false, _) => "$",
+                            (true, false) => JAVA_DOLLAR,
+                            (true, true) => JAVA_DOLLAR_UNIX,
+                        });
+                    i += 1;
+                }
+                '.' => {
+                    // (?s) is passed to the Rust engine, where a plain `.` then matches everything
+                    self.out.push_str(if st.dotall || st.unix_lines {
+                        "."
                     } else {
-                        "$"
+                        JAVA_DOT
                     });
                     i += 1;
                 }
+                '{' => i = self.brace(i),
                 c if st.ascii_icase(self.opts) && c.is_ascii_alphabetic() => {
                     self.push_both_cases(c);
                     i += 1;
@@ -144,6 +216,31 @@ impl Scanner {
                 }
             }
         }
+    }
+
+    /// `{`: Java accepts `{n}`, `{n,}` and `{n,m}` only (as a quantifier); anything else is "Illegal repetition".
+    fn brace(&mut self, i: usize) -> usize {
+        let digits = |s: &Self, mut j: usize| {
+            let start = j;
+            while s.at(j).is_some_and(|c| c.is_ascii_digit()) {
+                j += 1;
+            }
+            (j, j > start)
+        };
+        let (mut j, has_digits) = digits(self, i + 1);
+        if has_digits && self.at(j) == Some(',') {
+            j = digits(self, j + 1).0;
+        }
+        if !has_digits || self.at(j) != Some('}') {
+            self.fail(&format!("Illegal repetition near index {i}"));
+            self.out.push('{');
+            return i + 1;
+        }
+        for k in i..=j {
+            let c = self.chars[k];
+            self.out.push(c);
+        }
+        j + 1
     }
 
     fn push_both_cases(&mut self, c: char) {
@@ -224,8 +321,13 @@ impl Scanner {
                     new.multiline = true;
                     on_rust.push('m');
                 }
-                's' | 'x' => on_rust.push(f),
-                'd' | 'c' => {}
+                's' => {
+                    new.dotall = true;
+                    on_rust.push('s');
+                }
+                'x' => on_rust.push(f),
+                'd' => new.unix_lines = true,
+                'c' => {}
                 other => on_rust.push(other),
             }
         }
@@ -238,8 +340,13 @@ impl Scanner {
                     new.multiline = false;
                     off_rust.push('m');
                 }
-                's' | 'x' => off_rust.push(f),
-                'd' | 'c' => {}
+                's' => {
+                    new.dotall = false;
+                    off_rust.push('s');
+                }
+                'x' => off_rust.push(f),
+                'd' => new.unix_lines = false,
+                'c' => {}
                 other => off_rust.push(other),
             }
         }
@@ -276,10 +383,12 @@ impl Scanner {
         }
         let ascii_icase = st.ascii_icase(self.opts);
         let mut extras: Vec<(char, char)> = Vec::new();
+        let mut closed = false;
         while let Some(c) = self.at(i) {
             match c {
                 ']' => {
                     i += 1;
+                    closed = true;
                     break;
                 }
                 '[' => i = self.class(i, st),
@@ -310,6 +419,9 @@ impl Scanner {
                     }
                 }
             }
+        }
+        if !closed {
+            self.fail("Unclosed character class");
         }
         for (lo, hi) in extras {
             self.push_case_counterparts(lo, hi);
@@ -387,6 +499,10 @@ impl Scanner {
                 next = j;
             }
             'p' | 'P' => next = self.property(i, n == 'P', uni),
+            '1'..='9' if (n as usize - '0' as usize) > self.groups => {
+                // Java compiles a reference to a group that does not exist and it never matches
+                self.out.push_str("(?!)");
+            }
             '1'..='9' => {
                 if st.icase && self.opts.ascii_icase_expansion && !st.unicode_case {
                     self.needs_fallback = true;
@@ -450,7 +566,7 @@ impl Scanner {
         next
     }
 
-    /// `\p{..}` / `\P{..}` / `\pL`. Java POSIX names are translated, every other property is copied verbatim.
+    /// `\p{..}` / `\P{..}` / `\pL`: POSIX names, `javaXxx`, `InBlock`, `IsProperty`, `key=value`; other names go to the Rust engine as they are.
     fn property(&mut self, i: usize, negated: bool, uni: bool) -> usize {
         let letter = if negated { 'P' } else { 'p' };
         if self.at(i + 2) != Some('{') {
@@ -471,30 +587,102 @@ impl Scanner {
             }
             name.push(c);
         }
-        match POSIX.iter().find(|(java, _, _)| *java == name) {
-            Some((_, ascii, unicode)) => {
-                let positive = if uni { *unicode } else { *ascii };
+        match property_set(&name, uni) {
+            Ok(Some(positive)) => {
                 if !negated {
-                    self.out.push_str(positive);
+                    self.out.push_str(&positive);
                 } else if let Some(prop) = positive.strip_prefix(r"\p") {
                     self.out.push_str(r"\P");
                     self.out.push_str(prop);
                 } else {
                     self.out.push_str("[^");
-                    self.out.push_str(positive);
+                    self.out.push_str(&positive);
                     self.out.push(']');
                 }
             }
-            None => {
+            Ok(None) => {
                 self.out.push('\\');
                 self.out.push(letter);
                 self.out.push('{');
                 self.out.push_str(&name);
                 self.out.push('}');
             }
+            Err(e) => {
+                self.fail(&e);
+                self.out.push_str("(?!)");
+            }
         }
         j
     }
+}
+
+/// The set a `\p{name}` of Java names, as a Rust class; `None` when the Rust engine reads the name the same way.
+fn property_set(name: &str, uni: bool) -> Result<Option<String>, String> {
+    let block = |n: &str| match block_range(n) {
+        Some((lo, hi)) => Ok(Some(format!(r"[\x{{{lo:X}}}-\x{{{hi:X}}}]"))),
+        None => Err(format!("Unknown character block name {{{n}}}")),
+    };
+    if let Some((key, value)) = name.split_once('=') {
+        return match key.to_ascii_lowercase().as_str() {
+            "script" | "sc" | "general_category" | "gc" => Ok(Some(format!(r"\p{{{value}}}"))),
+            "block" | "blk" => block(value),
+            _ => Err(format!(
+                "Unknown Unicode property {{name={key}, value={value}}}"
+            )),
+        };
+    }
+    if let Some((_, ascii, unicode)) = POSIX.iter().find(|(java, _, _)| *java == name) {
+        return Ok(Some((if uni { *unicode } else { *ascii }).to_string()));
+    }
+    if let Some(java) = name.strip_prefix("java") {
+        let set = match java {
+            "LowerCase" => r"\p{Lowercase}",
+            "UpperCase" => r"\p{Uppercase}",
+            "TitleCase" => r"\p{Lt}",
+            "Digit" => r"\p{Nd}",
+            "Defined" => r"[^\p{Cn}]",
+            "Letter" => r"\p{L}",
+            "LetterOrDigit" => r"[\p{L}\p{Nd}]",
+            "Alphabetic" => r"\p{Alphabetic}",
+            "Ideographic" => r"\p{Ideographic}",
+            "SpaceChar" => r"\p{Z}",
+            "Whitespace" => r"[[\t\n\x0B\f\r\x1C-\x1F\p{Z}]&&[^\x{A0}\x{2007}\x{202F}]]",
+            "ISOControl" => r"[\x00-\x1F\x7F-\x9F]",
+            "Mirrored" => r"\p{Bidi_Mirrored}",
+            "IdentifierIgnorable" => r"[\x00-\x08\x0E-\x1B\x7F-\x9F\p{Cf}]",
+            "UnicodeIdentifierStart" => r"[\p{L}\p{Nl}]",
+            "UnicodeIdentifierPart" => {
+                r"[\p{L}\p{Nl}\p{Nd}\p{Mn}\p{Mc}\p{Pc}\x00-\x08\x0E-\x1B\x7F-\x9F\p{Cf}]"
+            }
+            "JavaIdentifierStart" => r"[\p{L}\p{Nl}\p{Sc}\p{Pc}]",
+            "JavaIdentifierPart" => {
+                r"[\p{L}\p{Nl}\p{Sc}\p{Pc}\p{Nd}\p{Mn}\p{Mc}\x00-\x08\x0E-\x1B\x7F-\x9F\p{Cf}]"
+            }
+            _ => return Err(format!("Unknown character property name {{{name}}}")),
+        };
+        return Ok(Some(set.to_string()));
+    }
+    if let Some(b) = name.strip_prefix("In").filter(|b| !b.is_empty()) {
+        return block(b);
+    }
+    if let Some(p) = name.strip_prefix("Is").filter(|p| !p.is_empty()) {
+        let set = match p.to_ascii_lowercase().replace('_', "").as_str() {
+            "letter" => r"\p{L}".to_string(),
+            "titlecase" => r"\p{Lt}".to_string(),
+            "punctuation" => r"\p{P}".to_string(),
+            "control" => r"\p{Cc}".to_string(),
+            "digit" => r"\p{Nd}".to_string(),
+            "whitespace" => r"\p{White_Space}".to_string(),
+            "hexdigit" => HEX_DIGIT.to_string(),
+            "joincontrol" => r"\p{Join_Control}".to_string(),
+            "noncharactercodepoint" => r"\p{Noncharacter_Code_Point}".to_string(),
+            "assigned" => r"[^\p{Cn}]".to_string(),
+            // Alphabetic, Ideographic, Lowercase, Uppercase, Emoji..., scripts and categories keep their names
+            _ => format!(r"\p{{{p}}}"),
+        };
+        return Ok(Some(set));
+    }
+    Ok(None)
 }
 
 #[cfg(test)]

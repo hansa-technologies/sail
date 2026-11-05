@@ -382,10 +382,16 @@ fn extract_first_match(
     re: &SparkRegex,
     group_idx: i64,
 ) -> Result<String> {
-    validate_group_idx(function_name, group_idx)?;
-    match re.find_first(value)? {
-        Some(spans) => extract_capture(function_name, value, &spans, group_idx),
+    let group = validate_group_idx(function_name, group_idx)?;
+    let max_group_idx = re.group_count();
+    match re.group_of_first_match(value, group.min(max_group_idx))? {
         None => Ok(String::new()),
+        Some(_) if group > max_group_idx => Err(generic_exec_err(
+            function_name,
+            &format!("Expects group index between 0 and {max_group_idx}, but got {group}"),
+        )),
+        Some(Some((start, end))) => Ok(value[start..end].to_string()),
+        Some(None) => Ok(String::new()),
     }
 }
 

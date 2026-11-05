@@ -36,6 +36,17 @@ enum Engine {
 }
 
 impl Engine {
+    /// Span of the first match at or after byte offset `start`.
+    fn find_at(&self, text: &str, start: usize) -> Result<Option<(usize, usize)>> {
+        match self {
+            Self::Fast(re) => Ok(re.find_at(text, start).map(|m| (m.start(), m.end()))),
+            Self::Fancy(re) => Ok(re
+                .find_from_pos(text, start)
+                .map_err(runtime_err)?
+                .map(|m| (m.start(), m.end()))),
+        }
+    }
+
     /// `regex` first, `fancy-regex` when it rejects the pattern. The error of the last engine tried is returned, because it is the one
     /// that says what is wrong (`regex` alone would call a valid back-reference unsupported).
     fn compile(pattern: &str) -> std::result::Result<Self, String> {
@@ -73,6 +84,11 @@ impl SparkRegex {
         if t.needs_icase_fallback {
             opts.ascii_icase_expansion = false;
             t = translate(pattern, opts);
+        }
+        if let Some(e) = &t.error {
+            return Err(DataFusionError::Execution(format!(
+                "{function_name}: invalid regex pattern `{pattern}`: {e}"
+            )));
         }
         let engine = Engine::compile(&t.pattern).map_err(|e| {
             DataFusionError::Execution(format!(
@@ -160,29 +176,49 @@ impl SparkRegex {
         }
     }
 
-    /// Span of the first match at or after byte offset `start`, without capture groups (cheaper than `captures_at`).
-    fn find_range_at(&self, text: &str, start: usize) -> Result<Option<(usize, usize)>> {
-        match self.engine_for(text) {
-            Engine::Fast(re) => Ok(re.find_at(text, start).map(|m| (m.start(), m.end()))),
-            Engine::Fancy(re) => Ok(re
-                .find_from_pos(text, start)
-                .map_err(runtime_err)?
-                .map(|m| (m.start(), m.end()))),
+    /// Calls `f` with the span of each match in `Matcher.find()` iteration, without capture groups, until it returns `false`; see
+    /// [`Self::find_all`]. No allocation, and the engine for the text is chosen once.
+    fn scan_ranges(&self, text: &str, mut f: impl FnMut(usize, usize) -> bool) -> Result<()> {
+        let engine = self.engine_for(text);
+        let mut start = 0;
+        while start <= text.len() {
+            let Some((m_start, m_end)) = engine.find_at(text, start)? else {
+                break;
+            };
+            start = next_search_start(text, m_start, m_end);
+            if !f(m_start, m_end) {
+                break;
+            }
         }
+        Ok(())
     }
 
     /// Spans of all matches with `Matcher.find()` iteration, without capture groups; see [`Self::find_all`].
     pub fn find_all_ranges(&self, text: &str) -> Result<Vec<(usize, usize)>> {
         let mut out = Vec::new();
-        let mut start = 0;
-        while start <= text.len() {
-            let Some((m_start, m_end)) = self.find_range_at(text, start)? else {
-                break;
-            };
-            start = next_search_start(text, m_start, m_end);
-            out.push((m_start, m_end));
-        }
+        self.scan_ranges(text, |s, e| {
+            out.push((s, e));
+            true
+        })?;
         Ok(out)
+    }
+
+    /// The span of capture group `group` in the first match: `None` when nothing matches, `Some(None)` when the group did not take part.
+    /// Does not allocate (unlike [`Self::find_first`]), which matters for `regexp_extract` over many rows.
+    pub fn group_of_first_match(
+        &self,
+        text: &str,
+        group: usize,
+    ) -> Result<Option<Option<(usize, usize)>>> {
+        match self.engine_for(text) {
+            Engine::Fast(re) => Ok(re
+                .captures(text)
+                .map(|caps| caps.get(group).map(|m| (m.start(), m.end())))),
+            Engine::Fancy(re) => Ok(re
+                .captures(text)
+                .map_err(runtime_err)?
+                .map(|caps| caps.get(group).map(|m| (m.start(), m.end())))),
+        }
     }
 
     /// All matches with `Matcher.find()` iteration. After an empty match the
@@ -230,16 +266,17 @@ impl SparkRegex {
         let limited = limit > 0;
         let mut parts: Vec<&str> = Vec::new();
         let mut index = 0;
-        for (m_start, m_end) in self.find_all_ranges(text)? {
+        self.scan_ranges(text, |m_start, m_end| {
             if limited && parts.len() + 1 >= limit as usize {
-                break;
+                return false;
             }
             if index == 0 && m_start == 0 && m_end == 0 {
-                continue;
+                return true;
             }
             parts.push(&text[index..m_start]);
             index = m_end;
-        }
+            true
+        })?;
         if index == 0 && parts.is_empty() {
             return Ok(vec![text.to_string()]);
         }
@@ -259,11 +296,13 @@ impl SparkRegex {
                 last = m_end;
             }
         } else {
-            for (m_start, m_end) in self.find_all_ranges(text)? {
+            let none = Vec::new();
+            self.scan_ranges(text, |m_start, m_end| {
                 out.push_str(&text[last..m_start]);
-                replacement.expand(text, &Vec::new(), &mut out);
+                replacement.expand(text, &none, &mut out);
                 last = m_end;
-            }
+                true
+            })?;
         }
         out.push_str(&text[last..]);
         Ok(out)
@@ -533,8 +572,161 @@ mod tests {
 
     #[test]
     fn both_engines_rejecting_reports_the_fancy_error() {
-        let err = SparkRegex::new("test", r"(a)\2").unwrap_err().to_string();
+        let err = SparkRegex::new("test", "(?<=a").unwrap_err().to_string();
         assert!(!err.contains("backreferences are not supported"), "{err}");
+    }
+
+    #[test]
+    fn java_character_properties() {
+        let m = |p: &str, t: &str| re(p).is_match(t).unwrap();
+        assert!(m(r"^\p{javaUpperCase}", "Я"));
+        assert!(!m(r"^\p{javaUpperCase}", "я"));
+        assert!(m(r"^\p{javaLowerCase}+$", "яa"));
+        assert!(m(
+            r"^\p{javaLetter}\p{javaDigit}\p{javaLetterOrDigit}$",
+            "я5x"
+        ));
+        assert!(m(r"^\p{javaWhitespace}$", "\t") && m(r"^\p{javaWhitespace}$", "\u{2003}"));
+        assert!(
+            !m(r"^\p{javaWhitespace}$", "\u{a0}"),
+            "Character.isWhitespace is false for the no-break space"
+        );
+        assert!(m(r"^\P{javaUpperCase}$", "a"));
+        assert!(m(r"^\p{InCyrillic}+$", "Привет") && !m(r"\p{InCyrillic}", "abc"));
+        assert!(
+            m(r"^\p{InBasicLatin}+$", "abc")
+                && m(r"^\p{InBasic Latin}+$", "abc")
+                && m(r"^\p{InBASIC_LATIN}+$", "abc")
+        );
+        assert!(
+            m(r"^\p{block=Cyrillic}+$", "Привет")
+                && m(r"^\p{IsCyrillic}+$", "Привет")
+                && m(r"^\p{script=Cyrillic}+$", "Привет")
+        );
+        assert!(
+            m(r"^\p{IsAlphabetic}+$", "Привет")
+                && m(r"^\p{IsL}+$", "Привет")
+                && m(r"^\p{gc=Lu}$", "П")
+                && m(r"^\p{IsLatin}+$", "abc")
+        );
+        assert!(m(r"^\p{IsWhite_Space}$", " ") && m(r"^\p{IsPunctuation}$", "!"));
+        for bad in [r"\p{InNoSuchBlock}", r"\p{javaNoSuchThing}", r"\p{foo=bar}"] {
+            assert!(SparkRegex::new("t", bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn dot_excludes_every_java_line_terminator() {
+        let m = |p: &str, t: &str| re(p).is_match(t).unwrap();
+        for t in ["a\nb", "a\rb", "a\u{85}b", "a\u{2028}b", "a\u{2029}b"] {
+            assert!(!m("a.b", t), "{t:?}");
+            assert!(m("(?s)a.b", t), "{t:?}");
+        }
+        assert!(m("a.b", "a\u{b}b") && m("a.b", "a\u{c}b"));
+        assert!(!m("(?d)a.b", "a\nb") && m("(?d)a.b", "a\rb") && m("(?d)a.b", "a\u{2028}b"));
+        assert!(
+            m("a.b", "axb")
+                && m("a.+b", "axyb")
+                && m("(?s:a.b)a.b", "a\nbaxb")
+                && !m("(?s:a.b)a.b", "a\nba\nb")
+        );
+        assert_eq!(re(r"(.)\1+").find_first("\r\r").unwrap(), None);
+        assert!(m(r"(.)\1+", "aa"));
+        assert!(!m(r"\p{L}.*\p{L}", "a\rb") && m(r"\p{L}.*\p{L}", "a b"));
+        assert!(
+            m("[.]", ".") && !m("[.]", "x"),
+            "a dot inside a class is a literal dot"
+        );
+    }
+
+    #[test]
+    fn dollar_per_terminator_as_on_jdk_21() {
+        // checked against Spark 3.5.5 on JDK 21.0.12.1: $ matches before a final \n, \r, \u0085, \u2028, \u2029 and \r\n, not before \u000b/\u000c
+        let m = |t: &str| re("c$").is_match(t).unwrap();
+        for t in [
+            "c\n",
+            "c\r",
+            "c\u{85}",
+            "c\u{2028}",
+            "c\u{2029}",
+            "c\r\n",
+            "c",
+        ] {
+            assert!(m(t), "{t:?}");
+        }
+        for t in ["c\n\r", "c\n\n", "c\r\r", "c\u{b}", "c\u{c}", "cd"] {
+            assert!(!m(t), "{t:?}");
+        }
+        let d = |t: &str| re("(?d)c$").is_match(t).unwrap();
+        assert!(d("c\n") && d("c") && !d("c\r") && !d("c\u{2028}") && !d("c\r\n"));
+    }
+
+    #[test]
+    fn patterns_java_rejects_are_rejected() {
+        for bad in ["[a", "a{2", "a{", "a{,2}", "a{x}", "(?<!a[b"] {
+            assert!(SparkRegex::new("t", bad).is_err(), "{bad}");
+        }
+        for good in [
+            "a{2}",
+            "a{2,}",
+            "a{2,3}",
+            "[a]",
+            r"\{",
+            r"[{]",
+            "a|{1}x".trim_end_matches("|{1}x"),
+        ] {
+            assert!(SparkRegex::new("t", good).is_ok(), "{good}");
+        }
+        // a reference to a group that does not exist compiles and never matches
+        let r = SparkRegex::new("t", r"(a)\2").unwrap();
+        assert!(!r.is_match("aa").unwrap() && !r.is_match("a").unwrap());
+        assert!(re(r"(a)\1").is_match("aa").unwrap());
+        assert!(re(r"(?<n>a)\1").is_match("aa").unwrap());
+    }
+
+    /// Properties whose data differs between the JDK's Unicode 15.0 and the Rust engine's 16.0 for code points both have assigned: the
+    /// difference in the number of matching code points (fork minus JDK). Anything else must match exactly.
+    const UNICODE_DRIFT: &[(&str, i64)] = &[
+        (r"\p{javaAlphabetic}", 33),
+        (r"\p{IsAlphabetic}", 33),
+        (r"(?U)\p{Alpha}", 33),
+        (r"(?U)\p{Alnum}", 33),
+        (r"\p{javaMirrored}", 1),
+        (r"\p{javaUnicodeIdentifierStart}", -6),
+        (r"\p{javaUnicodeIdentifierPart}", -16),
+    ];
+
+    #[test]
+    fn character_classes_match_the_jdk_exactly() {
+        use super::super::java_class_checksums::{JAVA_ASSIGNED, JAVA_CLASS_CHECKSUMS};
+        let all: String = JAVA_ASSIGNED
+            .iter()
+            .flat_map(|(lo, hi)| (*lo..=*hi).filter_map(char::from_u32))
+            .collect();
+        let mut bad = Vec::new();
+        for (pattern, count, sum) in JAVA_CLASS_CHECKSUMS {
+            let r = SparkRegex::new("t", &format!("(?:{pattern})")).unwrap();
+            let (mut n, mut total) = (0u64, 0u64);
+            for (start, _) in r.find_all_ranges(&all).unwrap() {
+                n += 1;
+                total += all[start..].chars().next().unwrap() as u64;
+            }
+            let drift = UNICODE_DRIFT
+                .iter()
+                .find(|(p, _)| p == pattern)
+                .map(|(_, d)| *d);
+            let same = match drift {
+                // Unicode 16 (the Rust tables) reclassified a few assigned code points against Unicode 15.0 (the JDK)
+                Some(d) => n as i64 - *count as i64 == d,
+                None => (n, total) == (*count, *sum),
+            };
+            if !same {
+                bad.push(format!(
+                    "{pattern}: fork {n} code points (sum {total}), JDK 21 {count} (sum {sum})"
+                ));
+            }
+        }
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
     }
 
     #[test]

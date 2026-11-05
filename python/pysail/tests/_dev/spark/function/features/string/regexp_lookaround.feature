@@ -186,3 +186,87 @@ Feature: regex look-around and back-references in rlike, regexp_extract, regexp_
         | $ before a final CRLF                  | concat('abc', char(13), char(10)) RLIKE 'c$'                                       | true    |
         | $ not between CR and LF                | concat('abc', char(13), char(10)) RLIKE 'c\\r$'                                  | false   |
         | $ not before two newlines              | concat('abc', char(10), char(10)) RLIKE 'c$'                                       | false   |
+
+  Rule: Java character properties
+
+    Scenario Outline: <case>
+      When query
+        """
+        SELECT <expr> AS result
+        """
+      Then query result
+        | result   |
+        | <result> |
+
+      Examples:
+        | case                              | expr                                                          | result |
+        | javaUpperCase matches Cyrillic    | 'Я' RLIKE '^\\p{javaUpperCase}'                               | true   |
+        | javaUpperCase rejects lower case  | 'я' RLIKE '^\\p{javaUpperCase}'                               | false  |
+        | javaLowerCase                     | 'привет' RLIKE '^\\p{javaLowerCase}+$'                        | true   |
+        | javaLetter and javaDigit          | 'я5' RLIKE '^\\p{javaLetter}\\p{javaDigit}$'                  | true   |
+        | javaWhitespace excludes NBSP      | concat('a', char(160), 'b') RLIKE 'a\\p{javaWhitespace}b'     | false  |
+        | negated javaUpperCase             | 'a' RLIKE '^\\P{javaUpperCase}$'                              | true   |
+        | InCyrillic block                  | 'Привет' RLIKE '^\\p{InCyrillic}+$'                           | true   |
+        | InCyrillic rejects Latin          | 'abc' RLIKE '\\p{InCyrillic}'                                 | false  |
+        | InBasicLatin                      | 'abc' RLIKE '^\\p{InBasicLatin}+$'                            | true   |
+        | IsCyrillic script                 | 'Привет' RLIKE '^\\p{IsCyrillic}+$'                           | true   |
+        | IsAlphabetic                      | 'Привет' RLIKE '^\\p{IsAlphabetic}+$'                         | true   |
+        | script= form                      | 'Привет' RLIKE '^\\p{script=Cyrillic}+$'                      | true   |
+        | block= form                       | 'Привет' RLIKE '^\\p{block=Cyrillic}+$'                       | true   |
+        | gc= form                          | 'П' RLIKE '^\\p{gc=Lu}$'                                      | true   |
+
+  Rule: Dot and dollar follow Java's line terminators
+
+    Scenario Outline: <case>
+      When query
+        """
+        SELECT <expr> AS result
+        """
+      Then query result
+        | result   |
+        | <result> |
+
+      Examples:
+        | case                          | expr                                                     | result |
+        | dot excludes LF               | concat('a', char(10), 'b') RLIKE 'a.b'                   | false  |
+        | dot excludes CR               | concat('a', char(13), 'b') RLIKE 'a.b'                   | false  |
+        | dot excludes NEL              | concat('a', char(133), 'b') RLIKE 'a.b'                  | false  |
+        | dot excludes LINE SEPARATOR   | concat('a', decode(unhex('E280A8'), 'UTF-8'), 'b') RLIKE 'a.b' | false  |
+        | dot matches a vertical tab    | concat('a', char(11), 'b') RLIKE 'a.b'                   | true   |
+        | (?s) dot matches LF           | concat('a', char(10), 'b') RLIKE '(?s)a.b'               | true   |
+        | (?d) dot excludes only LF     | concat('a', char(13), 'b') RLIKE '(?d)a.b'               | true   |
+        | repeated char is not CR       | concat(char(13), char(13)) RLIKE '(.)\\1+'               | false  |
+        | $ before a final LINE SEP         | concat('abc', decode(unhex('E280A8'), 'UTF-8')) RLIKE 'c$'    | true   |
+        | $ before a final PARA SEP         | concat('abc', decode(unhex('E280A9'), 'UTF-8')) RLIKE 'c$'    | true   |
+        | $ before a final NEL          | concat('abc', char(133)) RLIKE 'c$'                      | true   |
+        | $ before a final CR           | concat('abc', char(13)) RLIKE 'c$'                       | true   |
+        | $ after LF CR                 | concat('abc', char(10), char(13)) RLIKE 'c$'             | false  |
+        | $ not before a vertical tab   | concat('abc', char(11)) RLIKE 'c$'                       | false  |
+        | (?d) $ before a final CR      | concat('abc', char(13)) RLIKE '(?d)c$'                   | false  |
+
+  Rule: Patterns Java rejects are errors
+
+    Scenario Outline: <case>
+      When query
+        """
+        SELECT 'a' RLIKE <pattern> AS result
+        """
+      Then query error (?s).*invalid regex.*
+
+      Examples:
+        | case                  | pattern       |
+        | unclosed class        | '[a'          |
+        | unclosed quantifier   | 'a{2'         |
+        | quantifier without digits | 'a{,2}'   |
+        | unknown block         | '\\p{InNoSuchBlock}' |
+
+  Rule: A back-reference to a missing group never matches
+
+    Scenario: Group 2 does not exist
+      When query
+        """
+        SELECT 'aa' RLIKE '(a)\\2' AS result
+        """
+      Then query result
+        | result |
+        | false  |
