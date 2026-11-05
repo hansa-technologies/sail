@@ -174,7 +174,7 @@ Feature: regex look-around and back-references in rlike, regexp_extract, regexp_
         | (?U) with a lazy quantifier            | regexp_extract('aaa', '(?U)a+?', 0)                          | a       |
         | (?U) makes \\w Unicode                | 'привет' RLIKE '(?U)^\\w+$'                                | true    |
         | \\w is ASCII without it               | 'привет' RLIKE '^\\w+$'                                    | false   |
-        | (?U) makes \\s Unicode                | regexp_replace('a\u00a0b', '(?U)\\s', '_')                 | a_b     |
+        | (?U) makes \\s Unicode                | regexp_replace(concat('a', char(160), 'b'), '(?U)\\s', '_')                 | a_b     |
         | (?U) scope ends with the group         | 'xя' RLIKE '(?U)x(?-U)\\w'                                 | false   |
         | (?U) mid-pattern                       | 'xя' RLIKE 'x(?U)\\w'                                      | true    |
         | (?U) with a back-reference             | 'ул. ул. Ленина' RLIKE '(?U)\\b(ул\\.?)\\s*\\1'     | true    |
