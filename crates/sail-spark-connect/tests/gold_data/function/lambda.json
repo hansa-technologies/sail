@@ -706,7 +706,7 @@
         }
       },
       "output": {
-        "failure": "not implemented: function: zip_with"
+        "success": "ok"
       }
     },
     {
@@ -732,7 +732,7 @@
         }
       },
       "output": {
-        "failure": "not implemented: function: zip_with"
+        "success": "ok"
       }
     },
     {
@@ -774,7 +774,7 @@
         }
       },
       "output": {
-        "failure": "not implemented: function: zip_with"
+        "success": "ok"
       }
     }
   ]

@@ -12,7 +12,6 @@ use datafusion_spark::function::string::elt::SparkElt;
 use datafusion_spark::function::string::expr_fn as string_fn;
 use datafusion_spark::function::string::format_string::FormatStringFunc;
 use datafusion_spark::function::string::length::SparkLengthFunc;
-use regex_syntax::hir::Look;
 use sail_common_datafusion::utils::items::ItemTaker;
 use sail_function::scalar::spark_cast_string_to_int32::SparkCastStringToInt32;
 use sail_function::scalar::spark_to_string::SparkToUtf8;
@@ -31,6 +30,7 @@ use sail_function::scalar::string::spark_regexp_extract_all::{
     SparkRegexpExtract, SparkRegexpExtractAll,
 };
 use sail_function::scalar::string::spark_regexp_instr::SparkRegexpInstr;
+use sail_function::scalar::string::spark_regexp_replace::SparkRegexpReplace;
 use sail_function::scalar::string::spark_sentences::SparkSentences;
 use sail_function::scalar::string::spark_split::SparkSplit;
 use sail_function::scalar::string::spark_to_binary::{SparkToBinary, SparkTryToBinary};
@@ -41,41 +41,6 @@ use crate::error::{PlanError, PlanResult};
 use crate::function::common::{ScalarFunction, ScalarFunctionInput};
 use crate::function::scalar::datetime::date_format;
 use crate::function::scalar::lambda::lambda_with_fresh_parameter;
-
-fn is_single_capture_extract(pattern: &expr::Expr, replacement: &expr::Expr) -> bool {
-    let (expr::Expr::Literal(pattern, _), expr::Expr::Literal(replacement, _)) =
-        (pattern, replacement)
-    else {
-        return false;
-    };
-    let (Some(pattern), Some("$1")) = (
-        pattern.try_as_str().flatten(),
-        replacement.try_as_str().flatten(),
-    ) else {
-        return false;
-    };
-    if !pattern.starts_with('^') {
-        return false;
-    }
-    let Some(short_pattern) = pattern.strip_suffix(".*$") else {
-        return false;
-    };
-
-    // Absolute start anchoring makes global and single replacement equivalent.
-    regex_syntax::parse(short_pattern).is_ok_and(|pattern| {
-        let properties = pattern.properties();
-        properties.look_set_prefix().contains(Look::Start)
-            && properties.explicit_captures_len() == 1
-    })
-}
-
-fn regexp_replace(string: expr::Expr, pattern: expr::Expr, replacement: expr::Expr) -> expr::Expr {
-    if is_single_capture_extract(&pattern, &replacement) {
-        regex_fn::regexp_replace(string, pattern, lit("${1}"), None)
-    } else {
-        regex_fn::regexp_replace(string, pattern, replacement, Some(lit("g")))
-    }
-}
 
 fn regexp_substr(input: ScalarFunctionInput) -> PlanResult<expr::Expr> {
     let (string, pattern) = input
@@ -484,7 +449,7 @@ pub(super) fn list_built_in_string_functions() -> Vec<(&'static str, ScalarFunct
         ("regexp_extract", F::udf(SparkRegexpExtract::new())),
         ("regexp_extract_all", F::udf(SparkRegexpExtractAll::new())),
         ("regexp_instr", F::custom(regexp_instr)),
-        ("regexp_replace", F::ternary(regexp_replace)),
+        ("regexp_replace", F::udf(SparkRegexpReplace::new())),
         ("regexp_substr", F::custom(regexp_substr)),
         ("repeat", F::binary(expr_fn::repeat)),
         ("replace", F::var_arg(replace)),

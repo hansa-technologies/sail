@@ -7461,6 +7461,7 @@ dependencies = [
  "datafusion-spark",
  "datasketches",
  "ecb",
+ "fancy-regex",
  "futures",
  "half",
  "jiter",

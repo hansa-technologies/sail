@@ -29,6 +29,7 @@ futures = { workspace = true }
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
 regex = { workspace = true }
+fancy-regex = { workspace = true }
 reqwest = { workspace = true }
 rand = { workspace = true }
 rand_chacha = { workspace = true }

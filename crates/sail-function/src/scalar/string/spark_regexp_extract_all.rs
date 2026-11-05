@@ -11,8 +11,8 @@ use datafusion_expr::function::Hint;
 use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
 use datafusion_expr_common::columnar_value::ColumnarValue;
 use datafusion_expr_common::signature::{Signature, Volatility};
-use regex::Regex;
 
+use super::spark_regex::{Spans, SparkRegex};
 use crate::error::{generic_exec_err, generic_internal_err, unsupported_data_types_exec_err};
 use crate::functions_nested_utils::opt_downcast_arg;
 use crate::functions_utils::{StrMemo, make_scalar_function};
@@ -342,8 +342,8 @@ impl<T: StringArrayLike + ?Sized> StringArrayLike for &T {
     }
 }
 
-fn parse_regex(function_name: &str, pattern: &str) -> Result<Regex> {
-    Regex::new(pattern).map_err(|_| generic_exec_err(function_name, "Invalid regex pattern"))
+fn parse_regex(function_name: &str, pattern: &str) -> Result<SparkRegex> {
+    SparkRegex::new(function_name, pattern)
 }
 
 fn validate_group_idx(function_name: &str, group_idx: i64) -> Result<usize> {
@@ -358,33 +358,33 @@ fn validate_group_idx(function_name: &str, group_idx: i64) -> Result<usize> {
 
 fn extract_capture(
     function_name: &str,
-    caps: &regex::Captures<'_>,
+    value: &str,
+    spans: &Spans,
     group_idx: i64,
 ) -> Result<String> {
     let group_idx = validate_group_idx(function_name, group_idx)?;
-    let max_group_idx = caps.len().saturating_sub(1);
+    let max_group_idx = spans.len().saturating_sub(1);
     if group_idx > max_group_idx {
         return Err(generic_exec_err(
             function_name,
             &format!("Expects group index between 0 and {max_group_idx}, but got {group_idx}"),
         ));
     }
-    Ok(caps
-        .get(group_idx)
-        .map(|m| m.as_str())
-        .unwrap_or("")
-        .to_string())
+    Ok(match spans[group_idx] {
+        Some((start, end)) => value[start..end].to_string(),
+        None => String::new(),
+    })
 }
 
 fn extract_first_match(
     function_name: &str,
     value: &str,
-    re: &Regex,
+    re: &SparkRegex,
     group_idx: i64,
 ) -> Result<String> {
     validate_group_idx(function_name, group_idx)?;
-    match re.captures(value) {
-        Some(caps) => extract_capture(function_name, &caps, group_idx),
+    match re.find_first(value)? {
+        Some(spans) => extract_capture(function_name, value, &spans, group_idx),
         None => Ok(String::new()),
     }
 }
@@ -392,13 +392,18 @@ fn extract_first_match(
 fn extract_all_matches(
     function_name: &str,
     value: &str,
-    re: &Regex,
+    re: &SparkRegex,
     group_idx: i64,
 ) -> Result<Vec<Option<String>>> {
     validate_group_idx(function_name, group_idx)?;
     let mut results = Vec::new();
-    for caps in re.captures_iter(value) {
-        results.push(Some(extract_capture(function_name, &caps, group_idx)?));
+    for spans in re.find_all(value)? {
+        results.push(Some(extract_capture(
+            function_name,
+            value,
+            &spans,
+            group_idx,
+        )?));
     }
     Ok(results)
 }
