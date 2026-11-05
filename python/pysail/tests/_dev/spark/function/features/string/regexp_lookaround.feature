@@ -156,3 +156,33 @@ Feature: regex look-around and back-references in rlike, regexp_extract, regexp_
         | ab | false  |
         | ab | true   |
         | ab | true   |
+
+  Rule: Flag groups follow Java
+
+    Scenario Outline: <case>
+      When query
+        """
+        SELECT <expr> AS result
+        """
+      Then query result
+        | result   |
+        | <result> |
+
+      Examples:
+        | case                                   | expr                                                         | result  |
+        | (?U) is not swap-greed                 | regexp_extract('aaa', '(?U)a+', 0)                           | aaa     |
+        | (?U) with a lazy quantifier            | regexp_extract('aaa', '(?U)a+?', 0)                          | a       |
+        | (?U) makes \\w Unicode                | 'привет' RLIKE '(?U)^\\w+$'                                | true    |
+        | \\w is ASCII without it               | 'привет' RLIKE '^\\w+$'                                    | false   |
+        | (?U) makes \\s Unicode                | regexp_replace('a\u00a0b', '(?U)\\s', '_')                 | a_b     |
+        | (?U) scope ends with the group         | 'xя' RLIKE '(?U)x(?-U)\\w'                                 | false   |
+        | (?U) mid-pattern                       | 'xя' RLIKE 'x(?U)\\w'                                      | true    |
+        | (?U) with a back-reference             | 'ул. ул. Ленина' RLIKE '(?U)\\b(ул\\.?)\\s*\\1'     | true    |
+        | (?i) folds ASCII only                  | 'ПРИВЕТ' RLIKE '(?i)привет'                                  | false   |
+        | (?iu) folds Unicode                    | 'ПРИВЕТ' RLIKE '(?iu)привет'                                 | true    |
+        | (?iU) folds Unicode                    | 'ПРИВЕТ' RLIKE '(?iU)привет'                                 | true    |
+        | (?i) with ASCII letters                | 'ABC' RLIKE '(?i)[a-c]+'                                     | true    |
+        | $ before a final newline               | concat('abc', char(10)) RLIKE 'c$'                                          | true    |
+        | $ before a final CRLF                  | concat('abc', char(13), char(10)) RLIKE 'c$'                                       | true    |
+        | $ not between CR and LF                | concat('abc', char(13), char(10)) RLIKE 'c\\r$'                                  | false   |
+        | $ not before two newlines              | concat('abc', char(10), char(10)) RLIKE 'c$'                                       | false   |

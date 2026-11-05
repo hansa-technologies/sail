@@ -15,7 +15,11 @@
 //! Known differences from Java that are not translated here (they hold for the
 //! fast path as well) are documented in `docs/` under "Regex compatibility".
 
+use std::sync::{Arc, OnceLock};
+
 use datafusion_common::{DataFusionError, Result};
+
+use super::java_syntax::{Options, translate};
 
 /// Upper bound on backtracking steps for the `fancy-regex` fallback. The crate's
 /// default (1M) is far too low for realistic Foundry patterns over long text;
@@ -31,32 +35,73 @@ enum Engine {
     Fancy(Box<fancy_regex::Regex>),
 }
 
+impl Engine {
+    /// `regex` first, `fancy-regex` when it rejects the pattern. The error of the last engine tried is returned, because it is the one
+    /// that says what is wrong (`regex` alone would call a valid back-reference unsupported).
+    fn compile(pattern: &str) -> std::result::Result<Self, String> {
+        match regex::Regex::new(pattern) {
+            Ok(re) => Ok(Self::Fast(re)),
+            Err(_) => fancy_regex::RegexBuilder::new(pattern)
+                .backtrack_limit(FANCY_BACKTRACK_LIMIT)
+                .build()
+                .map(|re| Self::Fancy(Box::new(re)))
+                .map_err(|e| e.to_string()),
+        }
+    }
+}
+
+/// Compiled lazily, once per regex, the first time a text ending in a line terminator is searched.
+type LazyEngine = Arc<OnceLock<Option<Engine>>>;
+
 #[derive(Debug, Clone)]
 pub struct SparkRegex {
     engine: Engine,
     pattern: String,
+    /// Java's `$` also matches before a final line terminator. That needs a look-around, which would put every pattern with a `$` on
+    /// the slow engine, so the plain engine is used unless the text ends in a line terminator, where this variant takes over.
+    java_dollar: Option<(String, LazyEngine)>,
 }
 
 impl SparkRegex {
-    /// Compiles `pattern` with `regex`, falling back to `fancy-regex`.
+    /// Compiles `pattern` (Java syntax) with `regex`, falling back to `fancy-regex`.
     pub fn new(function_name: &str, pattern: &str) -> Result<Self> {
-        let translated = java_to_rust_syntax(pattern);
-        let engine = match regex::Regex::new(&translated) {
-            Ok(re) => Engine::Fast(re),
-            Err(fast_err) => fancy_regex::RegexBuilder::new(&translated)
-                .backtrack_limit(FANCY_BACKTRACK_LIMIT)
-                .build()
-                .map(|re| Engine::Fancy(Box::new(re)))
-                .map_err(|_| {
-                    DataFusionError::Execution(format!(
-                        "{function_name}: invalid regex pattern `{pattern}`: {fast_err}"
-                    ))
-                })?,
+        let mut opts = Options {
+            java_dollar: false,
+            ascii_icase_expansion: true,
         };
+        let mut t = translate(pattern, opts);
+        if t.needs_icase_fallback {
+            opts.ascii_icase_expansion = false;
+            t = translate(pattern, opts);
+        }
+        let engine = Engine::compile(&t.pattern).map_err(|e| {
+            DataFusionError::Execution(format!(
+                "{function_name}: invalid regex pattern `{pattern}`: {e}"
+            ))
+        })?;
+        let java_dollar = t.has_dollar.then(|| {
+            opts.java_dollar = true;
+            (translate(pattern, opts).pattern, Arc::new(OnceLock::new()))
+        });
         Ok(Self {
             engine,
             pattern: pattern.to_string(),
+            java_dollar,
         })
+    }
+
+    /// The engine for `text`: the Java-`$` variant when the text ends in a line terminator and the pattern has a `$`.
+    fn engine_for(&self, text: &str) -> &Engine {
+        match &self.java_dollar {
+            Some((variant, cell))
+                if text.ends_with(['\n', '\r', '\u{85}', '\u{2028}', '\u{2029}']) =>
+            {
+                cell.get_or_init(|| Engine::compile(variant).ok())
+                    .as_ref()
+                    .unwrap_or(&self.engine)
+            }
+            _ => &self.engine,
+        }
     }
 
     /// The pattern as written by the user.
@@ -87,7 +132,7 @@ impl SparkRegex {
 
     /// Java `Matcher.find()`: a match anywhere in `text`.
     pub fn is_match(&self, text: &str) -> Result<bool> {
-        match &self.engine {
+        match self.engine_for(text) {
             Engine::Fast(re) => Ok(re.is_match(text)),
             Engine::Fancy(re) => re.is_match(text).map_err(runtime_err),
         }
@@ -96,7 +141,7 @@ impl SparkRegex {
     /// First match starting the search at byte offset `start`. The whole text is
     /// the context, so anchors and look-behind see what precedes `start`.
     pub fn captures_at(&self, text: &str, start: usize) -> Result<Option<Spans>> {
-        match &self.engine {
+        match self.engine_for(text) {
             Engine::Fast(re) => Ok(re.captures_at(text, start).map(|caps| {
                 (0..caps.len())
                     .map(|i| caps.get(i).map(|m| (m.start(), m.end())))
@@ -117,7 +162,7 @@ impl SparkRegex {
 
     /// Span of the first match at or after byte offset `start`, without capture groups (cheaper than `captures_at`).
     fn find_range_at(&self, text: &str, start: usize) -> Result<Option<(usize, usize)>> {
-        match &self.engine {
+        match self.engine_for(text) {
             Engine::Fast(re) => Ok(re.find_at(text, start).map(|m| (m.start(), m.end()))),
             Engine::Fancy(re) => Ok(re
                 .find_from_pos(text, start)
@@ -342,127 +387,6 @@ impl JavaReplacement {
     }
 }
 
-/// Java POSIX character classes (`\p{Alpha}`), which are ASCII-only in Java, as `regex` ASCII bracket classes.
-const POSIX_CLASSES: &[(&str, &str)] = &[
-    ("Lower", "lower"),
-    ("Upper", "upper"),
-    ("ASCII", "ascii"),
-    ("Alpha", "alpha"),
-    ("Digit", "digit"),
-    ("Alnum", "alnum"),
-    ("Punct", "punct"),
-    ("Graph", "graph"),
-    ("Print", "print"),
-    ("Blank", "blank"),
-    ("Cntrl", "cntrl"),
-    ("XDigit", "xdigit"),
-    ("Space", "space"),
-];
-
-/// Java's `\h`: horizontal whitespace.
-const HSPACE: &str = r"\x20\t\x{A0}\x{1680}\x{180E}\x{2000}-\x{200A}\x{202F}\x{205F}\x{3000}";
-/// Java's `\s`: `[ \t\n\x0B\f\r]`.
-const SPACE: &str = r" \t\n\x0B\f\r";
-
-/// Rewrites Java regex syntax that `regex`/`fancy-regex` read differently, or not at all, into the equivalent they understand:
-///
-/// - `\d \D \w \W \s \S \b \B` are ASCII-only in Java (without `UNICODE_CHARACTER_CLASS`; `\b` since JDK 19) but Unicode-aware
-///   here. `\w` matching Cyrillic letters, for example, would make `'привет' RLIKE '^\w+$'` true here and false in Spark.
-/// - `\p{Alpha}`-style POSIX classes (ASCII-only in Java) become `regex`'s ASCII bracket classes, `\h`/`\H` are expanded.
-/// - `\Q…\E` quotes literally.
-///
-/// An escaped backslash is never mistaken for an escape. Everything else, including patterns that are invalid, passes through
-/// unchanged, so those fail the same way they always did.
-fn java_to_rust_syntax(pattern: &str) -> std::borrow::Cow<'_, str> {
-    if !pattern.contains('\\') {
-        return std::borrow::Cow::Borrowed(pattern);
-    }
-    let mut out = String::with_capacity(pattern.len() + 16);
-    let mut chars = pattern.chars().peekable();
-    let mut class_depth = 0usize;
-    while let Some(c) = chars.next() {
-        match c {
-            '\\' => {
-                let Some(next) = chars.next() else {
-                    out.push('\\');
-                    break;
-                };
-                let in_class = class_depth > 0;
-                match next {
-                    'd' => out.push_str(if in_class { "0-9" } else { "[0-9]" }),
-                    'D' => out.push_str("[^0-9]"),
-                    'w' => out.push_str(if in_class {
-                        "a-zA-Z0-9_"
-                    } else {
-                        "[a-zA-Z0-9_]"
-                    }),
-                    'W' => out.push_str("[^a-zA-Z0-9_]"),
-                    's' if in_class => out.push_str(SPACE),
-                    's' => out.push_str(&format!("[{SPACE}]")),
-                    'S' => out.push_str(&format!("[^{SPACE}]")),
-                    'h' if in_class => out.push_str(HSPACE),
-                    'h' => out.push_str(&format!("[{HSPACE}]")),
-                    'H' => out.push_str(&format!("[^{HSPACE}]")),
-                    'b' if !in_class => out.push_str(r"(?-u:\b)"),
-                    'B' if !in_class => out.push_str(r"(?-u:\B)"),
-                    'Q' => {
-                        let mut quoted = String::new();
-                        while let Some(q) = chars.next() {
-                            if q == '\\' && chars.peek() == Some(&'E') {
-                                chars.next();
-                                break;
-                            }
-                            quoted.push(q);
-                        }
-                        out.push_str(&regex::escape(&quoted));
-                    }
-                    'p' | 'P' => {
-                        let rest: String = chars.clone().collect();
-                        let class = rest
-                            .strip_prefix('{')
-                            .and_then(|r| r.split_once('}'))
-                            .and_then(|(name, _)| {
-                                POSIX_CLASSES.iter().find(|(java, _)| *java == name)
-                            });
-                        match class {
-                            Some((java, ascii)) => {
-                                for _ in 0..java.chars().count() + 2 {
-                                    chars.next();
-                                }
-                                let negate = next == 'P';
-                                match (in_class, negate) {
-                                    (true, false) => out.push_str(&format!("[:{ascii}:]")),
-                                    (true, true) => out.push_str(&format!("[^[:{ascii}:]]")),
-                                    (false, false) => out.push_str(&format!("[[:{ascii}:]]")),
-                                    (false, true) => out.push_str(&format!("[^[:{ascii}:]]")),
-                                }
-                            }
-                            None => {
-                                out.push('\\');
-                                out.push(next);
-                            }
-                        }
-                    }
-                    _ => {
-                        out.push('\\');
-                        out.push(next);
-                    }
-                }
-            }
-            '[' => {
-                class_depth += 1;
-                out.push(c);
-            }
-            ']' if class_depth > 0 => {
-                class_depth -= 1;
-                out.push(c);
-            }
-            _ => out.push(c),
-        }
-    }
-    std::borrow::Cow::Owned(out)
-}
-
 #[cfg(test)]
 #[expect(clippy::unwrap_used)]
 mod tests {
@@ -543,6 +467,74 @@ mod tests {
         assert!(re(r"a\hb").is_match("a b").unwrap());
         assert!(re(r"a\hb").is_match("a\tb").unwrap());
         assert!(!re(r"a\hb").is_match("a\nb").unwrap());
+    }
+
+    #[test]
+    fn unicode_character_class_flag_is_java_not_rust_swap_greed() {
+        // (?U) in Rust would swap greediness; in Java it makes \w \d \s \b Unicode
+        let m = |p: &str, t: &str| re(p).find_first(t).unwrap().map(|s| s[0].unwrap());
+        assert_eq!(m("(?U)a+", "aaa"), Some((0, 3)));
+        assert_eq!(m("(?U)a+?", "aaa"), Some((0, 1)));
+        assert!(re(r"(?U)^\w+$").is_match("привет").unwrap());
+        assert!(!re(r"^\w+$").is_match("привет").unwrap());
+        assert!(re(r"(?iU)^\w+$").is_match("ПРИВЕТ").unwrap());
+        assert!(re(r"x(?U)\w").is_match("xя").unwrap());
+        assert!(!re(r"(?U)x(?-U)\w").is_match("xя").unwrap());
+        assert_eq!(
+            re(r"(?U)\s+").split("Иванов  Пётр", -1).unwrap(),
+            ["Иванов", "Пётр"]
+        );
+        assert_eq!(
+            re(r"(?U)(?<=\w)(?=\W)|(?<=\W)(?=\w)")
+                .split("Иван Петров", -1)
+                .unwrap(),
+            ["Иван", " ", "Петров"]
+        );
+        // backreference together with (?U): needs the fallback engine and the Unicode \b
+        let addr = re(r"(?U)\b((?:ул|д)\.?)\s*\1\.?\s*");
+        assert!(addr.is_fancy());
+        assert!(addr.is_match("ул. ул. Ленина").unwrap());
+        assert!(!addr.is_match("ул. д. Ленина").unwrap());
+    }
+
+    #[test]
+    fn ignore_case_is_ascii_only_without_u() {
+        assert!(!re(r"(?i)РАЙОН").is_match("район").unwrap());
+        assert!(re(r"(?iu)РАЙОН").is_match("район").unwrap());
+        assert!(re(r"(?iU)РАЙОН").is_match("район").unwrap());
+        assert!(re(r"(?i)abc").is_match("ABC").unwrap());
+        assert!(re(r"(?i)[a-c]+").is_match("ABC").unwrap());
+        assert!(!re(r"(?i)(?<!ЖИЛ)РАЙОН\.").is_match("район.").unwrap());
+        assert!(re(r"(?i)(?<!ЖИЛ)РАЙОН\.").is_match("РАЙОН.").unwrap());
+        assert!(re(r"(?i)(a)\1").is_match("aA").unwrap());
+    }
+
+    #[test]
+    fn dollar_matches_before_a_final_line_terminator_as_in_java() {
+        let m = |p: &str, t: &str| re(p).is_match(t).unwrap();
+        assert!(m("c$", "abc\n"));
+        assert!(m("c$", "abc\r\n"));
+        assert!(m("c$", "abc\r"));
+        assert!(m("c$", "abc\u{2028}"));
+        assert!(!m("c$", "abc\n\n"));
+        assert!(m("c$", "abc"));
+        assert!(!m("c$", "abcd"));
+        // no match between the \r and the \n of a final \r\n
+        assert!(!m(r"c\r$", "abc\r\n"));
+        assert!(!m("(?m)c$x", "abc"));
+        let r = re(r"(?<=\p{L})[\s-]+(\p{L}[\p{L}-]*)$");
+        assert_eq!(
+            r.find_first("Иван Петров\n").unwrap().unwrap()[1],
+            Some((9, 21))
+        );
+        let rep = JavaReplacement::parse("t", "", &re("c$")).unwrap();
+        assert_eq!(re("c$").replace_all("abc\n", &rep).unwrap(), "ab\n");
+    }
+
+    #[test]
+    fn both_engines_rejecting_reports_the_fancy_error() {
+        let err = SparkRegex::new("test", r"(a)\2").unwrap_err().to_string();
+        assert!(!err.contains("backreferences are not supported"), "{err}");
     }
 
     #[test]
