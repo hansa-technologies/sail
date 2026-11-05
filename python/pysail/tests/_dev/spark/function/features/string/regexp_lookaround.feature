@@ -124,7 +124,7 @@ Feature: regex look-around and back-references in rlike, regexp_extract, regexp_
 
   Rule: Class escapes are ASCII-only as in Java
 
-    Scenario Outline: <case>
+    Scenario Outline: Class escapes are ASCII-only as in Java: <case>
       When query
         """
         SELECT <expr> AS result
@@ -159,7 +159,7 @@ Feature: regex look-around and back-references in rlike, regexp_extract, regexp_
 
   Rule: Flag groups follow Java
 
-    Scenario Outline: <case>
+    Scenario Outline: Flag groups follow Java: <case>
       When query
         """
         SELECT <expr> AS result
@@ -189,7 +189,7 @@ Feature: regex look-around and back-references in rlike, regexp_extract, regexp_
 
   Rule: Java character properties
 
-    Scenario Outline: <case>
+    Scenario Outline: Java character properties: <case>
       When query
         """
         SELECT <expr> AS result
@@ -217,7 +217,7 @@ Feature: regex look-around and back-references in rlike, regexp_extract, regexp_
 
   Rule: Dot and dollar follow Java's line terminators
 
-    Scenario Outline: <case>
+    Scenario Outline: Dot and dollar follow Java's line terminators: <case>
       When query
         """
         SELECT <expr> AS result
@@ -246,7 +246,7 @@ Feature: regex look-around and back-references in rlike, regexp_extract, regexp_
 
   Rule: Patterns Java rejects are errors
 
-    Scenario Outline: <case>
+    Scenario Outline: Patterns Java rejects are errors: <case>
       When query
         """
         SELECT 'a' RLIKE <pattern> AS result
