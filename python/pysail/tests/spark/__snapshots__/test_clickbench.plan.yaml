@@ -382,7 +382,7 @@ data:
             FilterExec: count(Int64(1))@2 > 100000
               AggregateExec: mode=FinalPartitioned, gby=[k@0 as k], aggr=[avg(length(hits.#14)), count(Int64(1)), min(hits.#14)]
                 RepartitionExec: partitioning=Hash([k@0], 4), input_partitions=1
-                  AggregateExec: mode=Partial, gby=[regexp_replace(#14@0, ^https?:/(?:www.)?([^/]+)/.*$, ${1}) as k], aggr=[avg(length(hits.#14)), count(Int64(1)), min(hits.#14)]
+                  AggregateExec: mode=Partial, gby=[regexp_replace(#14@0, ^https?:/(?:www.)?([^/]+)/.*$, $1) as k], aggr=[avg(length(hits.#14)), count(Int64(1)), min(hits.#14)]
                     ProjectionExec: expr=[Referer@0 as #14]
                       FilterExec: Referer@0 != <eol>
                         DataSourceExec: file_groups={1 group: [[<tmp>/hits-00.parquet:<range>, <tmp>/hits-01.parquet:<range>, <tmp>/hits-02.parquet:<range>, <tmp>/hits-03.parquet:<range>]]}, projection=[Referer], file_type=parquet, predicate=Referer@14 != , pruning_predicate=Referer_null_count@2 != row_count@3 AND (Referer_min@0 !=  OR  != Referer_max@1), required_guarantees=[Referer not in ()]

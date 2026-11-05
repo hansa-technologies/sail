@@ -115,6 +115,31 @@ impl SparkRegex {
         }
     }
 
+    /// Span of the first match at or after byte offset `start`, without capture groups (cheaper than `captures_at`).
+    fn find_range_at(&self, text: &str, start: usize) -> Result<Option<(usize, usize)>> {
+        match &self.engine {
+            Engine::Fast(re) => Ok(re.find_at(text, start).map(|m| (m.start(), m.end()))),
+            Engine::Fancy(re) => Ok(re
+                .find_from_pos(text, start)
+                .map_err(runtime_err)?
+                .map(|m| (m.start(), m.end()))),
+        }
+    }
+
+    /// Spans of all matches with `Matcher.find()` iteration, without capture groups; see [`Self::find_all`].
+    pub fn find_all_ranges(&self, text: &str) -> Result<Vec<(usize, usize)>> {
+        let mut out = Vec::new();
+        let mut start = 0;
+        while start <= text.len() {
+            let Some((m_start, m_end)) = self.find_range_at(text, start)? else {
+                break;
+            };
+            start = next_search_start(text, m_start, m_end);
+            out.push((m_start, m_end));
+        }
+        Ok(out)
+    }
+
     /// All matches with `Matcher.find()` iteration. After an empty match the
     /// search resumes one character later; after a non-empty match it resumes at
     /// the match end, where an empty match is allowed again (unlike `regex`).
@@ -126,14 +151,7 @@ impl SparkRegex {
                 break;
             };
             let (m_start, m_end) = spans[0].unwrap_or((start, start));
-            start = if m_end == m_start {
-                match text[m_end..].chars().next() {
-                    Some(c) => m_end + c.len_utf8(),
-                    None => text.len() + 1,
-                }
-            } else {
-                m_end
-            };
+            start = next_search_start(text, m_start, m_end);
             out.push(spans);
         }
         Ok(out)
@@ -167,11 +185,10 @@ impl SparkRegex {
         let limited = limit > 0;
         let mut parts: Vec<&str> = Vec::new();
         let mut index = 0;
-        for spans in self.find_all(text)? {
+        for (m_start, m_end) in self.find_all_ranges(text)? {
             if limited && parts.len() + 1 >= limit as usize {
                 break;
             }
-            let (m_start, m_end) = spans[0].unwrap_or((0, 0));
             if index == 0 && m_start == 0 && m_end == 0 {
                 continue;
             }
@@ -187,20 +204,35 @@ impl SparkRegex {
 
     /// `Matcher.replaceAll(replacement)` with Java replacement syntax.
     pub fn replace_all(&self, text: &str, replacement: &JavaReplacement) -> Result<String> {
-        let matches = self.find_all(text)?;
-        if matches.is_empty() {
-            return Ok(text.to_string());
-        }
         let mut out = String::with_capacity(text.len());
         let mut last = 0;
-        for spans in matches {
-            let (m_start, m_end) = spans[0].unwrap_or((last, last));
-            out.push_str(&text[last..m_start]);
-            replacement.expand(text, &spans, &mut out)?;
-            last = m_end;
+        if replacement.uses_groups() {
+            for spans in self.find_all(text)? {
+                let (m_start, m_end) = spans[0].unwrap_or((last, last));
+                out.push_str(&text[last..m_start]);
+                replacement.expand(text, &spans, &mut out);
+                last = m_end;
+            }
+        } else {
+            for (m_start, m_end) in self.find_all_ranges(text)? {
+                out.push_str(&text[last..m_start]);
+                replacement.expand(text, &Vec::new(), &mut out);
+                last = m_end;
+            }
         }
         out.push_str(&text[last..]);
         Ok(out)
+    }
+}
+
+/// Where `Matcher.find()` resumes: at the match end, or one character further after an empty match.
+fn next_search_start(text: &str, m_start: usize, m_end: usize) -> usize {
+    if m_end != m_start {
+        return m_end;
+    }
+    match text[m_end..].chars().next() {
+        Some(c) => m_end + c.len_utf8(),
+        None => text.len() + 1,
     }
 }
 
@@ -289,7 +321,14 @@ impl JavaReplacement {
         Ok(Self { parts })
     }
 
-    fn expand(&self, text: &str, spans: &Spans, out: &mut String) -> Result<()> {
+    /// Whether any part refers to a capture group (otherwise matching can skip the capture machinery).
+    fn uses_groups(&self) -> bool {
+        self.parts
+            .iter()
+            .any(|p| matches!(p, ReplacementPart::Group(_)))
+    }
+
+    fn expand(&self, text: &str, spans: &Spans, out: &mut String) {
         for part in &self.parts {
             match part {
                 ReplacementPart::Literal(s) => out.push_str(s),
@@ -300,7 +339,6 @@ impl JavaReplacement {
                 }
             }
         }
-        Ok(())
     }
 }
 

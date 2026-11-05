@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, ArrayRef, StringArray, StringBuilder};
-use datafusion::arrow::datatypes::DataType;
+use datafusion::arrow::datatypes::{DataType, Field, FieldRef};
 use datafusion_common::Result;
 use datafusion_common::utils::take_function_args;
 use datafusion_expr::function::Hint;
-use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
+use datafusion_expr::{ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl};
 use datafusion_expr_common::columnar_value::ColumnarValue;
 use datafusion_expr_common::signature::{Signature, Volatility};
 
@@ -18,9 +18,6 @@ use crate::functions_utils::{StrMemo, make_scalar_function};
 ///
 /// Uses the `regex` crate and falls back to `fancy-regex` for look-around and
 /// back-references (see [`SparkRegex`]).
-/// Name used in user-facing error messages (the UDF itself is registered as `SparkRegexpReplace::NAME`).
-const FUNCTION: &str = "regexp_replace";
-
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct SparkRegexpReplace {
     signature: Signature,
@@ -33,7 +30,7 @@ impl Default for SparkRegexpReplace {
 }
 
 impl SparkRegexpReplace {
-    pub const NAME: &'static str = "spark_regexp_replace";
+    pub const NAME: &'static str = "regexp_replace";
 
     pub fn new() -> Self {
         Self {
@@ -53,6 +50,12 @@ impl ScalarUDFImpl for SparkRegexpReplace {
 
     fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
         Ok(DataType::Utf8)
+    }
+
+    /// NULL when any argument is NULL, so a non-null input gives a non-nullable result, as in Spark.
+    fn return_field_from_args(&self, args: ReturnFieldArgs) -> Result<FieldRef> {
+        let nullable = args.arg_fields.iter().any(|f| f.is_nullable());
+        Ok(Arc::new(Field::new(self.name(), DataType::Utf8, nullable)))
     }
 
     fn coerce_types(&self, arg_types: &[DataType]) -> Result<Vec<DataType>> {
@@ -89,7 +92,7 @@ fn regexp_replace_inner(args: &[ArrayRef]) -> Result<ArrayRef> {
         ));
     };
 
-    let name = FUNCTION;
+    let name = SparkRegexpReplace::NAME;
     let scalar_pattern = (pattern.len() == 1 && pattern.is_valid(0))
         .then(|| SparkRegex::new(name, pattern.value(0)))
         .transpose()?;

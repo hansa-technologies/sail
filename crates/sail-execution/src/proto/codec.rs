@@ -3880,8 +3880,8 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
             }
             "spark_split" | "split" => Ok(Arc::new(ScalarUDF::from(SparkSplit::new()))),
             "regexp_extract" => Ok(Arc::new(ScalarUDF::from(SparkRegexpExtract::new()))),
-            "spark_regexp_replace" => Ok(Arc::new(ScalarUDF::from(SparkRegexpReplace::new()))),
-            "spark_rlike" => Ok(Arc::new(ScalarUDF::from(SparkRlike::new()))),
+            "regexp_replace" => Ok(Arc::new(ScalarUDF::from(SparkRegexpReplace::new()))),
+            "rlike" => Ok(Arc::new(ScalarUDF::from(SparkRlike::new()))),
             "regexp_extract_all" => Ok(Arc::new(ScalarUDF::from(SparkRegexpExtractAll::new()))),
             "sentences" => Ok(Arc::new(ScalarUDF::from(SparkSentences::new()))),
             "spark_hex" | "hex" => Ok(Arc::new(ScalarUDF::from(SparkHex::new()))),
@@ -8168,6 +8168,97 @@ mod tests {
         let decoded = round_trip_expr(&physical, &schema)?;
         assert_eq!(as_hof(&decoded)?.name(), "map_filter");
         assert_same_result(&physical, &decoded, schema, vec![Arc::new(map)])
+    }
+
+    /// `zip_with` survives remote encode/decode, in both parameter orders (a lambda that only uses its second
+    /// parameter is planned over the swapped instance).
+    #[test]
+    fn test_round_trip_distributed_zip_with() -> Result<()> {
+        use std::collections::HashMap;
+
+        use datafusion::arrow::array::{Int32Array, ListArray};
+        use datafusion::arrow::buffer::OffsetBuffer;
+        use datafusion::arrow::datatypes::{DataType, Field};
+        use datafusion::common::DFSchema;
+        use datafusion::logical_expr::execution_props::ExecutionProps;
+        use datafusion::logical_expr::expr::{HigherOrderFunction, LambdaVariable};
+        use datafusion::logical_expr::{Expr, HigherOrderUDF, col, lambda};
+        use datafusion::physical_expr::create_physical_expr;
+        use sail_function::scalar::array::spark_array_zip_with::SparkArrayZipWith;
+
+        let list = |values: Vec<i32>, lengths: Vec<usize>| {
+            ListArray::new(
+                Arc::new(Field::new_list_field(DataType::Int32, true)),
+                OffsetBuffer::<i32>::from_lengths(lengths),
+                Arc::new(Int32Array::from(values)),
+                None,
+            )
+        };
+        let left = list(vec![1, 2, 3], vec![3]);
+        let right = list(vec![10, 20], vec![2]);
+        let fields = vec![
+            Field::new("l", left.data_type().clone(), true),
+            Field::new("r", right.data_type().clone(), true),
+        ];
+        let schema = Arc::new(Schema::new(fields.clone()));
+        let dfschema = DFSchema::from_unqualified_fields(fields.into(), HashMap::new())?;
+        let var = |name: &str| {
+            Expr::LambdaVariable(LambdaVariable::new(
+                name.to_string(),
+                Some(Arc::new(Field::new(name, DataType::Int32, true))),
+            ))
+        };
+        for (func, params, body) in [
+            (
+                SparkArrayZipWith::new(),
+                vec!["x", "y"],
+                var("x") + var("y"),
+            ),
+            (SparkArrayZipWith::new_swapped(), vec!["y"], var("y")),
+        ] {
+            let swapped = func.is_swapped();
+            let logical = Expr::HigherOrderFunction(HigherOrderFunction::new(
+                Arc::new(HigherOrderUDF::new_from_impl(func)),
+                vec![col("l"), col("r"), lambda(params, body)],
+            ));
+            let physical = create_physical_expr(
+                &logical,
+                &dfschema,
+                &ExecutionProps::new(),
+                &PhysicalPlanningContext::default(),
+            )?;
+            let decoded = round_trip_expr(&physical, &schema)?;
+            let hof = as_hof(&decoded)?;
+            assert_eq!(hof.name(), "zip_with");
+            let inner = hof.fun().inner().as_ref() as &dyn std::any::Any;
+            assert_eq!(
+                inner
+                    .downcast_ref::<SparkArrayZipWith>()
+                    .map(SparkArrayZipWith::is_swapped),
+                Some(swapped)
+            );
+            assert_same_result(
+                &physical,
+                &decoded,
+                Arc::clone(&schema),
+                vec![Arc::new(left.clone()), Arc::new(right.clone())],
+            )?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_round_trip_spark_regex_udfs() -> Result<()> {
+        let rlike = round_trip_udf(ScalarUDF::from(SparkRlike::new()))?;
+        assert!(rlike.inner().downcast_ref::<SparkRlike>().is_some());
+        let replace = round_trip_udf(ScalarUDF::from(SparkRegexpReplace::new()))?;
+        assert!(
+            replace
+                .inner()
+                .downcast_ref::<SparkRegexpReplace>()
+                .is_some()
+        );
+        Ok(())
     }
 
     /// Distributed round-trip for `transform_values(m, (k, v) -> v + 1)` over
