@@ -44,8 +44,19 @@ These behaviors of `java.util.regex` are not reproduced. Each is checked against
 
 - Unicode data: the JDK 21 uses Unicode 15.0 and the Rust engines Unicode 16. Characters assigned after 15.0 are outside what Java matches, so `\p{L}` and friends match them here. For code points both assign, every Java class in the table checked against the JDK matches exactly except `Alphabetic` (33 more here, which also affects `\p{javaAlphabetic}`, `(?U)\p{Alpha}`, `(?U)\p{Alnum}`), `Bidi_Mirrored` (1 more), and the identifier classes `\p{javaUnicodeIdentifierStart}` (6 fewer) and `\p{javaUnicodeIdentifierPart}` (16 fewer), which are approximated from general categories.
 - In `(?m)` mode `^` and `$` see only `\n` as a line terminator, not `\r`, `\u0085`, `\u2028`, `\u2029`. `(?c)` is ignored.
-- Case-insensitive back-references under `(?iu)`/`(?iU)` use the Rust engine's Unicode folding, which differs from Java for the dotted/dotless i (`ı`, `İ`).
+- Case folding. Under `(?iu)`/`(?iU)`, `i` and `[a-z]` match `İ` (U+0130) and `ı` (U+0131) in Java, and a back-reference folds them with `i`; here neither does. Under plain `(?i)`, which is ASCII-only in Java, a back-reference still folds Unicode here: `(?i)(.)\1` matches `яЯ`, `éÉ`, `σς`.
 - A `{` at the start of a pattern or after `(` or `|` (`{1}`) is passed to the engine as it is; Java accepts some of these.
 - Inside a character class combined with `&&`, `(?i)` adds the other case of a letter to the whole class instead of to the left operand only.
 - Possessive quantifiers (`a++`, `a*+`, `a?+`) are accepted but are not possessive: `'aaa' RLIKE 'a++a'` is `false` in Spark and `true` here. Atomic groups (`(?>…)`) work as in Java.
 - `regexp_count`, `regexp_instr` and `regexp_substr` still use the `regex` crate only, so look-around and back-references are not available in them. The talos-pipelines transforms do not use them.
+
+### Further differences measured against Spark
+
+None of these occurs in the real transform patterns checked so far, and each has a test that must keep failing so that a fix shows up.
+
+- Case-insensitive properties and escapes: `(?i)\p{Lu}`, `\p{Lower}`, `\p{Upper}` and `\p{javaLowerCase}` do not widen to the other case (Java does); `(?iu)\p{Lower}` and `\p{Lu}` differ on U+017F, U+212A, U+0345 and 882 caseless letters.
+- Escapes: `\v` misses `\n`, `\x0c`, `\u0085`, `\u2028`, `\u2029`. `\B`, `\b`, `\G`, `\X`, `\b{g}` and `\V` differ or are errors. `\p{IsGraph}` and `\p{IsPrint}` match many more code points than in Java, and `\p{IsXDigit}` is an error.
+- Line ends: `\Z` does not match before a final `\r`, `\r\n`, `\u0085`, `\u2028` or `\u2029` (it does before `\n`). `(?m)^` matches after a final line terminator at the end of the input, Java does not.
+- Accepted here but rejected by Java: `a**`, `a{3,2}`, `x{2,1}`, `(?P<n>a)`, `(?#c)a`, `(?<1a>a)`, `(?<a_1>a)`, duplicate group names, `\p{L`, `\p{^Lu}`, `\N`, `\N{nosuch}`, `(?--i)a`, `[a-\w]`, `[a--]`, `\p{InLatin1Supplement}`, `\p{InGreek_And_Coptic}`, `\p{IsMath}`, and the bare `\p{Greek}`, `\p{Latin}`, `\p{Letter}`, `\p{Any}`.
+- Rejected here but accepted by Java: `(a)\10`, `(a)\11`, `\01`, `\0101`, `\cA`, `(?=a)*`, `(?=a)+`, `(?=a){2}`, `x{1,2147483647}`, `\p{InHighSurrogates}`.
+- Read differently: `\<` and `\>` (literal in Java), `\N{LATIN SMALL LETTER A}`, `[a&&]`, `[[:alpha:]]`, `[\w-a]`, `[--a]`, `a{2}{3}`, `a{1}{2}`, `a?+`.
