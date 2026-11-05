@@ -19,6 +19,7 @@ use sail_function::scalar::array::spark_array_filter::SparkArrayFilter;
 use sail_function::scalar::array::spark_array_forall::SparkArrayForall;
 use sail_function::scalar::array::spark_array_sort::SparkArraySort;
 use sail_function::scalar::array::spark_array_transform::SparkArrayTransform;
+use sail_function::scalar::array::spark_array_zip_with::SparkArrayZipWith;
 use sail_function::scalar::array::spark_sequence::SparkSequenceLazy;
 use sail_function::scalar::datetime::convert_tz::ConvertTzLazy;
 use sail_function::scalar::map::spark_map_filter::SparkMapFilter;
@@ -174,6 +175,10 @@ pub(super) fn try_encode_higher_order_udf(
     } else if let Some(transform) = udf_inner.downcast_ref::<SparkArrayTransform>() {
         HigherOrderUdfKind::Transform(r#gen::SparkArrayTransformUdf {
             index_first: transform.is_index_first(),
+        })
+    } else if let Some(zip_with) = udf_inner.downcast_ref::<SparkArrayZipWith>() {
+        HigherOrderUdfKind::ZipWith(r#gen::SparkArrayZipWithUdf {
+            swapped: zip_with.is_swapped(),
         })
     } else if let Some(aggregate) = udf_inner.downcast_ref::<SparkArrayAggregate>() {
         HigherOrderUdfKind::Aggregate(r#gen::SparkArrayAggregateUdf {

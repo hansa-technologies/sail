@@ -11,9 +11,9 @@ use datafusion_expr::function::Hint;
 use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
 use datafusion_expr_common::columnar_value::ColumnarValue;
 use datafusion_expr_common::signature::{Signature, Volatility};
-use regex::Regex;
 
-use crate::error::{generic_exec_err, generic_internal_err, unsupported_data_types_exec_err};
+use super::spark_regex::SparkRegex;
+use crate::error::{generic_internal_err, unsupported_data_types_exec_err};
 use crate::functions_nested_utils::opt_downcast_arg;
 use crate::functions_utils::{StrMemo, make_scalar_function};
 
@@ -163,20 +163,12 @@ where
     }
 }
 
-pub fn parse_regex(format: &str) -> Result<Regex> {
-    Regex::new(format).map_err(|_| generic_exec_err(SparkSplit::NAME, "Invalid regex"))
+pub fn parse_regex(format: &str) -> Result<SparkRegex> {
+    SparkRegex::new(SparkSplit::NAME, format)
 }
 
-pub fn split_to_array(value: &str, format: &Regex, limit: i32) -> Result<Vec<Option<String>>> {
-    let values: Vec<&str> = if limit > 0 {
-        format.splitn(value, limit as usize).collect::<Vec<&str>>()
-    } else {
-        format.split(value).collect::<Vec<&str>>()
-    };
-    Ok(values
-        .iter()
-        .map(|value| Some(value.to_string()))
-        .collect::<Vec<Option<String>>>())
+pub fn split_to_array(value: &str, format: &SparkRegex, limit: i32) -> Result<Vec<Option<String>>> {
+    Ok(format.split(value, limit)?.into_iter().map(Some).collect())
 }
 
 #[cfg(test)]

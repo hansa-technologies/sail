@@ -5,6 +5,7 @@ use datafusion_common::ScalarValue;
 use datafusion_expr::{Operator, ScalarUDF, expr, lit, not};
 use sail_common_datafusion::utils::items::ItemTaker;
 use sail_function::scalar::predicate::rewrite_like_pattern::RewriteLikePatternFunc;
+use sail_function::scalar::string::spark_rlike::SparkRlike;
 
 use crate::error::{PlanError, PlanResult};
 use crate::function::common::{ScalarFunction, ScalarFunctionInput};
@@ -75,13 +76,7 @@ fn build_like_expr(input: ScalarFunctionInput, case_insensitive: bool) -> PlanRe
 }
 
 fn rlike(expr: expr::Expr, pattern: expr::Expr) -> expr::Expr {
-    expr::Expr::SimilarTo(expr::Like {
-        negated: false,
-        expr: Box::new(expr),
-        pattern: Box::new(pattern),
-        case_insensitive: false,
-        escape_char: None,
-    })
+    ScalarUDF::from(SparkRlike::new()).call(vec![expr, pattern])
 }
 
 fn is_in_list(input: ScalarFunctionInput) -> PlanResult<expr::Expr> {

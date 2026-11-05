@@ -16,6 +16,7 @@ use sail_function::scalar::array::spark_array_filter::SparkArrayFilter;
 use sail_function::scalar::array::spark_array_forall::SparkArrayForall;
 use sail_function::scalar::array::spark_array_sort::SparkArraySort;
 use sail_function::scalar::array::spark_array_transform::SparkArrayTransform;
+use sail_function::scalar::array::spark_array_zip_with::SparkArrayZipWith;
 use sail_function::scalar::map::spark_map_filter::SparkMapFilter;
 use sail_function::scalar::map::spark_transform_keys::SparkTransformKeys;
 use sail_function::scalar::map::spark_transform_values::SparkTransformValues;
@@ -75,6 +76,15 @@ static SPARK_ARRAY_TRANSFORM_INDEX_FIRST_UDF: LazyLock<Arc<HigherOrderUDF>> = La
     ))
 });
 
+static SPARK_ARRAY_ZIP_WITH_UDF: LazyLock<Arc<HigherOrderUDF>> =
+    LazyLock::new(|| Arc::new(HigherOrderUDF::new_from_impl(SparkArrayZipWith::new())));
+
+static SPARK_ARRAY_ZIP_WITH_SWAPPED_UDF: LazyLock<Arc<HigherOrderUDF>> = LazyLock::new(|| {
+    Arc::new(HigherOrderUDF::new_from_impl(
+        SparkArrayZipWith::new_swapped(),
+    ))
+});
+
 static SPARK_ARRAY_SORT_UDF: LazyLock<Arc<HigherOrderUDF>> =
     LazyLock::new(|| Arc::new(HigherOrderUDF::new_from_impl(SparkArraySort::new())));
 
@@ -94,6 +104,7 @@ pub(crate) fn is_higher_order_function(name: &str) -> bool {
             | "exists"
             | "forall"
             | "array_sort"
+            | "zip_with"
     )
 }
 
@@ -115,6 +126,7 @@ pub(crate) fn get_lambda_parameters(
         "exists" => &SPARK_ARRAY_EXISTS_UDF,
         "forall" => &SPARK_ARRAY_FORALL_UDF,
         "array_sort" => &SPARK_ARRAY_SORT_UDF,
+        "zip_with" => &SPARK_ARRAY_ZIP_WITH_UDF,
         other => {
             return Err(PlanError::internal(format!(
                 "not a higher-order function: {other}"
@@ -475,6 +487,35 @@ fn aggregate(input: ScalarFunctionInput) -> PlanResult<expr::Expr> {
     )))
 }
 
+/// Builds `zip_with(left, right, (x, y) -> ...)`. A lambda that uses only its
+/// second parameter is rewritten to `y -> ...` over the swapped instance (see
+/// [`SparkArrayZipWith`]).
+fn zip_with(input: ScalarFunctionInput) -> PlanResult<expr::Expr> {
+    let (left, right, lambda) = input.arguments.three()?;
+    expect_lambda_arity("zip_with", &lambda, 2)?;
+    let (func, lambda) = match lambda {
+        expr::Expr::Lambda(lambda)
+            if !lambda_body_uses_param(&lambda.body, &lambda.params[0])?
+                && lambda_body_uses_param(&lambda.body, &lambda.params[1])? =>
+        {
+            let Lambda { params, body } = lambda;
+            let (_left, right_param) = params.two()?;
+            (
+                Arc::clone(&SPARK_ARRAY_ZIP_WITH_SWAPPED_UDF),
+                expr::Expr::Lambda(Lambda {
+                    params: vec![right_param],
+                    body,
+                }),
+            )
+        }
+        lambda => (Arc::clone(&SPARK_ARRAY_ZIP_WITH_UDF), lambda),
+    };
+    Ok(expr::Expr::HigherOrderFunction(HigherOrderFunction::new(
+        func,
+        vec![left, right, lambda],
+    )))
+}
+
 /// Spark's array_sort always puts NULLs last, regardless of sort direction
 /// https://spark.apache.org/docs/latest/api/sql/index.html#array_sort
 fn array_sort_spark(array: expr::Expr, asc: expr::Expr) -> PlanResult<expr::Expr> {
@@ -564,6 +605,6 @@ pub(super) fn list_built_in_lambda_functions() -> Vec<(&'static str, ScalarFunct
         ("transform", F::custom(transform)),
         ("transform_keys", F::custom(transform_keys)),
         ("transform_values", F::custom(transform_values)),
-        ("zip_with", F::unknown("zip_with")),
+        ("zip_with", F::custom(zip_with)),
     ]
 }

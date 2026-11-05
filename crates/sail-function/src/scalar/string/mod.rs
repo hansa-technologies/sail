@@ -1,5 +1,9 @@
 pub mod decimal_format;
 pub mod format_number;
+pub mod java_blocks;
+#[cfg(test)]
+mod java_class_checksums;
+pub mod java_syntax;
 pub mod levenshtein;
 pub mod make_valid_utf8;
 pub mod randstr;
@@ -10,8 +14,11 @@ pub mod spark_encode_decode;
 pub mod spark_length;
 pub mod spark_mask;
 pub mod spark_quote;
+pub mod spark_regex;
 pub mod spark_regexp_extract_all;
 pub mod spark_regexp_instr;
+pub mod spark_regexp_replace;
+pub mod spark_rlike;
 pub mod spark_sentences;
 pub mod spark_split;
 pub mod spark_to_binary;

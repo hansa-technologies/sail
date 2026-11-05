@@ -171,6 +171,7 @@ message HigherOrderUdf {
     SparkRegexpInstrUdf regexp_instr = 10;
     SparkTransformValuesUdf transform_values = 11;
     SparkTransformKeysUdf transform_keys = 12;
+    SparkArrayZipWithUdf zip_with = 13;
   }
 }
 
@@ -179,6 +180,12 @@ message SparkArrayAggregateUdf {
 }
 
 message SparkArrayExistsUdf {}
+
+message SparkArrayZipWithUdf {
+  // True when the lambda parameters are `[right, left]` (a lambda using only
+  // its second parameter, rewritten by the planner).
+  bool swapped = 1;
+}
 
 message SparkRegexpInstrUdf {
   bool ansi_mode = 1;
